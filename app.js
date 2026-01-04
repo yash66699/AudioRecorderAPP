@@ -660,7 +660,6 @@
 
 // window.audioRecorder = new AudioRecorder();
 
-
 // Google Drive API Configuration
 const GOOGLE_CONFIG = {
     CLIENT_ID: '561390564463-32380lelkhlm9a9g7r631mhbv6hln29s.apps.googleusercontent.com',
@@ -679,7 +678,7 @@ let accessToken = null;
 // Selected Google Drive folder ID for uploads
 let selectedFolderId = null;
 
-// Google API initialization (called by script tags)
+// Google API initialization
 window.gapiLoaded = () => {
     gapi = window.gapi;
     gapi.load('client:auth2', async () => {
@@ -821,7 +820,107 @@ class GoogleDriveManager {
     }
 }
 
-// Audio Recorder with Stereo Support
+// ============================================================
+// DUAL MICROPHONE MANAGER - Captures stereo from dual mics
+// ============================================================
+class DualMicrophoneManager {
+    constructor() {
+        this.streams = [];
+        this.sources = [];
+        this.splitters = [];
+        this.audioContext = null;
+        this.destinationNode = null;
+        this.mediaStreamDestination = null;
+        this.stereoStream = null;
+    }
+
+    async initialize(audioContext) {
+        this.audioContext = audioContext;
+        
+        try {
+            // Get all available audio input devices
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(device => device.kind === 'audioinput');
+            
+            console.log(`🎙️ Found ${audioInputs.length} audio input devices:`);
+            audioInputs.forEach((device, index) => {
+                console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`} (${device.deviceId})`);
+            });
+
+            if (audioInputs.length < 2) {
+                console.warn('⚠️ Only one microphone found. Using mono fallback.');
+                return false;
+            }
+
+            // Create destination for stereo stream
+            this.mediaStreamDestination = this.audioContext.createMediaStreamDestination();
+            this.stereoStream = this.mediaStreamDestination.stream;
+
+            // Capture first two microphones
+            const firstMic = await navigator.mediaDevices.getUserMedia({
+                audio: { deviceId: audioInputs[0].deviceId, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+            });
+
+            const secondMic = await navigator.mediaDevices.getUserMedia({
+                audio: { deviceId: audioInputs[1].deviceId, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+            });
+
+            this.streams = [firstMic, secondMic];
+
+            // Create sources from both mics
+            const source1 = this.audioContext.createMediaStreamSource(firstMic);
+            const source2 = this.audioContext.createMediaStreamSource(secondMic);
+
+            this.sources = [source1, source2];
+
+            // Create splitters to access individual channels
+            const splitter1 = this.audioContext.createChannelSplitter(1);
+            const splitter2 = this.audioContext.createChannelSplitter(1);
+
+            this.splitters = [splitter1, splitter2];
+
+            // Create merger to combine into stereo
+            const merger = this.audioContext.createChannelMerger(2);
+
+            // Connect left mic to left channel
+            source1.connect(splitter1);
+            splitter1.connect(merger, 0, 0);
+
+            // Connect right mic to right channel
+            source2.connect(splitter2);
+            splitter2.connect(merger, 0, 1);
+
+            // Connect merger to destination
+            merger.connect(this.mediaStreamDestination);
+
+            console.log('✅ Dual microphone stereo mode ACTIVE');
+            console.log(`   Left Channel: ${audioInputs[0].label || 'Microphone 1'}`);
+            console.log(`   Right Channel: ${audioInputs[1].label || 'Microphone 2'}`);
+
+            return true;
+        } catch (error) {
+            console.error('❌ Dual microphone initialization failed:', error);
+            return false;
+        }
+    }
+
+    getStream() {
+        return this.stereoStream;
+    }
+
+    stopAllStreams() {
+        this.streams.forEach(stream => {
+            stream.getTracks().forEach(track => track.stop());
+        });
+        this.streams = [];
+        this.sources = [];
+        this.splitters = [];
+    }
+}
+
+// ============================================================
+// AUDIO RECORDER WITH DUAL MIC SUPPORT
+// ============================================================
 class AudioRecorder {
     constructor() {
         this.mediaRecorder = null;
@@ -832,7 +931,9 @@ class AudioRecorder {
         this.isRecording = false;
         this.countdownInterval = null;
         this.driveManager = new GoogleDriveManager();
-        this.stereoChannelCount = 0; // Track actual channel count
+        this.dualMicManager = new DualMicrophoneManager();
+        this.stereoChannelCount = 0;
+        this.usingStereoMics = false;
 
         document.addEventListener('DOMContentLoaded', () => this.initialize());
     }
@@ -883,7 +984,7 @@ class AudioRecorder {
         }
 
         // Initial states
-        this.updateMicrophoneStatus('', 'Requesting microphone access...');
+        this.updateMicrophoneStatus('', 'Initializing audio system...');
         this.recordButton.disabled = true;
         this.clearAllButton.disabled = true;
         this.uploadAllButton.disabled = true;
@@ -953,43 +1054,50 @@ class AudioRecorder {
         }
 
         try {
-            // ============================================
-            // STEREO RECORDING CONFIGURATION
-            // ============================================
-            // Request 2 channels (stereo) with NO audio processing
-            // to preserve spatial features
-            this.stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    sampleRate: 44100,
-                    channelCount: 2,              // REQUEST STEREO
-                    echoCancellation: false,      // MUST be false to preserve spatial details
-                    noiseSuppression: false,      // MUST be false to preserve spatial details
-                    autoGainControl: false,       // MUST be false to prevent level matching
-                    googAutoGainControl: false    // Extra flag for older Chrome versions
-                }
-            });
+            // Initialize audio context first
+            this.initializeAudioContext();
 
-            // Verify actual channel count received
-            const track = this.stream.getAudioTracks()[0];
-            if (track) {
-                const settings = track.getSettings();
-                this.stereoChannelCount = settings.channelCount || 2;
-                console.log('🎙️ Microphone Settings:', settings);
-                
-                if (this.stereoChannelCount === 2) {
-                    console.log('✅ Stereo recording ACTIVE (2 channels)');
-                    this.updateMicrophoneStatus('active', 'Microphone ready (Stereo - 2 channels)');
-                } else if (this.stereoChannelCount === 1) {
-                    console.warn('⚠️ System returned mono stream - check hardware');
-                    this.updateMicrophoneStatus('active', 'Microphone ready (Mono - hardware limitation)');
-                } else {
-                    this.updateMicrophoneStatus('active', `Microphone ready (${this.stereoChannelCount} channels)`);
+            // Try dual microphone mode first
+            const dualMicSuccess = await this.dualMicManager.initialize(this.audioContext);
+
+            if (dualMicSuccess) {
+                // Use stereo stream from dual microphones
+                this.stream = this.dualMicManager.getStream();
+                this.stereoChannelCount = 2;
+                this.usingStereoMics = true;
+                this.updateMicrophoneStatus('active', '🎙️🎙️ Dual Microphones (True Stereo)');
+            } else {
+                // Fallback to single microphone with stereo channel request
+                this.stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 44100,
+                        channelCount: 2,
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                        googAutoGainControl: false
+                    }
+                });
+
+                const track = this.stream.getAudioTracks()[0];
+                if (track) {
+                    const settings = track.getSettings();
+                    this.stereoChannelCount = settings.channelCount || 1;
+                    console.log('Microphone Settings:', settings);
+                    
+                    if (this.stereoChannelCount === 2) {
+                        console.log('✅ Stereo recording ACTIVE (2 channels from single device)');
+                        this.updateMicrophoneStatus('active', '🎤 Single Microphone (Stereo Mode)');
+                    } else {
+                        console.warn('⚠️ System returned mono stream');
+                        this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check if your device supports stereo)');
+                    }
                 }
             }
 
             this.recordButton.disabled = false;
             this.statusMessage.textContent = 'Ready to record';
-            this.initializeAudioContext();
+
         } catch (error) {
             console.error('❌ Microphone Access Error:', error);
             this.updateMicrophoneStatus('error', 'Microphone access denied');
@@ -1000,7 +1108,9 @@ class AudioRecorder {
 
     initializeAudioContext() {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
-        if (AudioContext) this.audioContext = new AudioContext();
+        if (AudioContext && !this.audioContext) {
+            this.audioContext = new AudioContext();
+        }
     }
 
     updateMicrophoneStatus(status, message) {
@@ -1130,14 +1240,18 @@ class AudioRecorder {
             cached: !navigator.onLine,
             uploaded: false,
             driveUrl: null,
-            channels: this.stereoChannelCount // Store channel count in recording metadata
+            channels: this.stereoChannelCount,
+            stereoMics: this.usingStereoMics
         };
 
         this.recordings.push(recording);
         this.addRecordingToList(recording);
         this.updateFileCount();
         this.resetRecordingState();
-        this.showSuccess(navigator.onLine ? 'Recording saved (Stereo)!' : 'Saved offline (Stereo)!');
+        
+        const recordingType = this.usingStereoMics ? 'Dual Mic Stereo' : 'Stereo';
+        this.showSuccess(navigator.onLine ? `Recording saved (${recordingType})!` : `Saved offline (${recordingType})!`);
+        
         this.clearAllButton.disabled = false;
         if (this.driveManager.isAuthenticated) this.uploadAllButton.disabled = false;
     }
@@ -1160,7 +1274,11 @@ class AudioRecorder {
         item.className = `recording-item${rec.uploaded ? ' uploaded' : ''}`;
         item.setAttribute('data-recording-id', rec.id);
 
-        const channelInfo = rec.channels === 2 ? '🎧 Stereo' : rec.channels === 1 ? '🔊 Mono' : `📻 ${rec.channels}ch`;
+        let channelInfo = '🎧 Stereo';
+        if (rec.channels === 1) channelInfo = '🔊 Mono';
+        else if (rec.channels > 2) channelInfo = `📻 ${rec.channels}ch`;
+
+        const micInfo = rec.stereoMics ? '🎙️🎙️ Dual Mic' : '🎤 Single Mic';
 
         item.innerHTML = `
             <div class="recording-info">
@@ -1171,6 +1289,7 @@ class AudioRecorder {
                     <span>Duration: ${rec.duration}s</span>
                     <span>Size: ${this.formatFileSize(rec.size)}</span>
                     <span class="channel-badge">${channelInfo}</span>
+                    <span class="mic-badge">${micInfo}</span>
                     ${rec.cached ? '<span class="pwa-status offline">Offline</span>' : '<span class="pwa-status online">Online</span>'}
                     ${rec.uploaded && rec.driveUrl ? `<a href="${rec.driveUrl}" target="_blank" class="drive-link">View in Drive</a>` : ''}
                 </div>
@@ -1332,7 +1451,7 @@ class AudioRecorder {
             <div class="empty-state">
                 <div class="empty-icon">📁</div>
                 <p>No recordings yet. Start recording to see your files here.</p>
-                <p class="pwa-info">📄 Works offline • 📱 Install as app • ☁️ Google Drive sync • 🎧 Stereo recording</p>
+                <p class="pwa-info">📄 Works offline • 📱 Install as app • ☁️ Google Drive sync • 🎙️🎙️ Dual Mic Stereo</p>
             </div>
         `;
     }
@@ -1342,11 +1461,13 @@ class AudioRecorder {
         const uploadedCount = this.recordings.filter(r => r.uploaded).length;
         const offlineCount = this.recordings.filter(r => r.cached).length;
         const stereoCount = this.recordings.filter(r => r.channels === 2).length;
+        const dualMicCount = this.recordings.filter(r => r.stereoMics).length;
 
         let text = `${count} file${count !== 1 ? 's' : ''}`;
         if (uploadedCount > 0) text += ` (${uploadedCount} uploaded)`;
         if (offlineCount > 0) text += ` (${offlineCount} offline)`;
-        if (stereoCount > 0) text += ` 🎧${stereoCount} stereo`;
+        if (dualMicCount > 0) text += ` 🎙️🎙️${dualMicCount} dual-mic`;
+        else if (stereoCount > 0) text += ` 🎧${stereoCount} stereo`;
 
         this.fileCount.textContent = text;
     }
@@ -1425,5 +1546,18 @@ class AudioRecorder {
 }
 
 window.audioRecorder = new AudioRecorder();
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
