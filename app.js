@@ -235,65 +235,93 @@ class AudioRecorder {
     }
 
     async requestMicrophoneAccess() {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            this.updateMicrophoneStatus('error', 'Microphone not supported');
-            return;
-        }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        this.updateMicrophoneStatus('error', 'Microphone not supported');
+        return;
+    }
 
-        try {
-            // Initialize audio context first
-            this.initializeAudioContext();
-            this.sampleRate = this.audioContext.sampleRate;
-            console.log(`Sample rate: ${this.sampleRate} Hz`);
+    try {
+        // Step 1: Initialize audio context first
+        this.initializeAudioContext();
+        this.sampleRate = this.audioContext.sampleRate;
+        console.log(`Sample rate: ${this.sampleRate} Hz`);
 
-            // Try dual microphone mode first
+        // Step 2: REQUEST PERMISSION FIRST - get a basic mono stream just to grant permission
+        console.log('Requesting microphone permission...');
+        const permissionStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        });
+
+        // Permission granted! Now we can enumerate devices
+        console.log('✅ Microphone permission granted');
+
+        // Step 3: Enumerate all audio devices NOW that permission is granted
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        
+        console.log(`🎙️ Found ${audioInputs.length} audio input devices:`);
+        audioInputs.forEach((device, index) => {
+            console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`}`);
+        });
+
+        // Step 4: Try dual microphone mode if we have 2+ devices
+        if (audioInputs.length >= 2) {
+            console.log('Attempting dual microphone mode...');
             const dualMicSuccess = await this.dualMicManager.initialize(this.audioContext);
 
             if (dualMicSuccess) {
-                // Use stereo stream from dual microphones
                 this.stream = this.dualMicManager.getStream();
                 this.stereoChannelCount = 2;
                 this.usingStereoMics = true;
                 this.updateMicrophoneStatus('active', '🎙️🎙️ Dual Microphones (True Stereo WAV)');
-            } else {
-                // Fallback to single microphone with stereo channel request
-                this.stream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        sampleRate: 44100,
-                        channelCount: 2,
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                        googAutoGainControl: false
-                    }
-                });
-
-                const track = this.stream.getAudioTracks()[0];
-                if (track) {
-                    const settings = track.getSettings();
-                    this.stereoChannelCount = settings.channelCount || 1;
-                    console.log('Microphone Settings:', settings);
-                    
-                    if (this.stereoChannelCount === 2) {
-                        console.log('✅ Stereo recording ACTIVE (2 channels from single device)');
-                        this.updateMicrophoneStatus('active', '🎤 Single Microphone (Stereo WAV)');
-                    } else {
-                        console.warn('⚠️ System returned mono stream');
-                        this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check if your device supports stereo)');
-                    }
-                }
+                
+                // Stop the permission stream since we're using dual mic streams
+                permissionStream.getTracks().forEach(track => track.stop());
+                
+                this.recordButton.disabled = false;
+                this.statusMessage.textContent = 'Ready to record';
+                return;
             }
-
-            this.recordButton.disabled = false;
-            this.statusMessage.textContent = 'Ready to record';
-
-        } catch (error) {
-            console.error('❌ Microphone Access Error:', error);
-            this.updateMicrophoneStatus('error', 'Microphone access denied');
-            this.recordButton.disabled = true;
-            this.statusMessage.textContent = 'Microphone access required';
         }
+
+        // Step 5: Fallback - use the permission stream for single mic stereo
+        console.log('Using single microphone with stereo request...');
+        this.stream = permissionStream;
+
+        const track = this.stream.getAudioTracks()[0];
+        if (track) {
+            const settings = track.getSettings();
+            this.stereoChannelCount = settings.channelCount || 1;
+            console.log('Microphone Settings:', settings);
+            
+            if (this.stereoChannelCount === 2) {
+                console.log('✅ Stereo recording ACTIVE (2 channels from single device)');
+                this.updateMicrophoneStatus('active', '🎤 Single Microphone (Stereo WAV)');
+            } else {
+                console.warn('⚠️ System returned mono stream');
+                this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check if your device supports stereo)');
+            }
+        }
+
+        this.recordButton.disabled = false;
+        this.statusMessage.textContent = 'Ready to record';
+
+    } catch (error) {
+        console.error('❌ Microphone Access Error:', error);
+        
+        if (error.name === 'NotAllowedError') {
+            this.updateMicrophoneStatus('error', 'Microphone permission denied - please enable in settings');
+        } else if (error.name === 'NotFoundError') {
+            this.updateMicrophoneStatus('error', 'No microphone found on this device');
+        } else {
+            this.updateMicrophoneStatus('error', `Microphone error: ${error.message}`);
+        }
+        
+        this.recordButton.disabled = true;
+        this.statusMessage.textContent = 'Microphone access required';
     }
+}
+
 
     initializeAudioContext() {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -745,3 +773,4 @@ class AudioRecorder {
 }
 
 window.audioRecorder = new AudioRecorder();
+
