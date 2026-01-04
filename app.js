@@ -1,32 +1,291 @@
 // ============================================================
+// GOOGLE DRIVE API CONFIGURATION
+// ============================================================
+const GOOGLE_CONFIG = {
+    CLIENT_ID: '561390564463-32380lelkhlm9a9g7r631mhbv6hln29s.apps.googleusercontent.com',
+    API_KEY: 'AIzaSyAfmO2Q-8-hGwAylaF2lRo_r7kB4vHT1aA',
+    DISCOVERY_DOC: 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest',
+    SCOPES: 'https://www.googleapis.com/auth/drive.file'
+};
+
+// Global Google API state
+let gapi, google;
+let isGapiLoaded = false;
+let isGisLoaded = false;
+let tokenClient;
+let accessToken = null;
+let selectedFolderId = null;
+
+// Google API initialization
+window.gapiLoaded = () => {
+    gapi = window.gapi;
+    gapi.load('client:auth2', async () => {
+        await initializeGapiClient();
+        gapi.load('picker', () => {
+            console.log('Picker API loaded');
+        });
+    });
+};
+
+window.gisLoaded = () => {
+    google = window.google;
+    isGisLoaded = true;
+    maybeEnableButtons();
+};
+
+async function initializeGapiClient() {
+    await gapi.client.init({
+        apiKey: GOOGLE_CONFIG.API_KEY,
+        discoveryDocs: [GOOGLE_CONFIG.DISCOVERY_DOC],
+    });
+    isGapiLoaded = true;
+    maybeEnableButtons();
+}
+
+function maybeEnableButtons() {
+    if (isGapiLoaded && isGisLoaded) {
+        tokenClient = google.accounts.oauth2.initTokenClient({
+            client_id: GOOGLE_CONFIG.CLIENT_ID,
+            scope: GOOGLE_CONFIG.SCOPES,
+            callback: (resp) => {
+                if (resp.error) {
+                    console.error('Error fetching access token:', resp.error);
+                    window.audioRecorder && window.audioRecorder.updateAuthenticationStatus(false);
+                    return;
+                }
+                accessToken = resp.access_token;
+                console.log('Access token received');
+                if (window.audioRecorder) {
+                    window.audioRecorder.updateAuthenticationStatus(true);
+                }
+            }
+        });
+    }
+}
+
+// ============================================================
+// GOOGLE DRIVE MANAGER
+// ============================================================
+class GoogleDriveManager {
+    constructor() {
+        this.isAuthenticated = false;
+        this.accessToken = null;
+    }
+
+    async authenticate() {
+        if (!isGapiLoaded || !isGisLoaded) {
+            throw new Error('Google APIs not loaded yet. Please wait.');
+        }
+
+        return new Promise((resolve, reject) => {
+            try {
+                if (gapi.client.getToken() === null) {
+                    tokenClient.requestAccessToken({ prompt: 'consent' });
+                } else {
+                    tokenClient.requestAccessToken({ prompt: '' });
+                }
+                resolve();
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    signOut() {
+        const token = gapi.client.getToken();
+        if (token !== null) {
+            google.accounts.oauth2.revoke(token.access_token);
+            gapi.client.setToken('');
+        }
+        this.isAuthenticated = false;
+        this.accessToken = null;
+    }
+
+    async uploadFile(fileBlob, fileName, onProgress) {
+        if (!this.isAuthenticated) throw new Error('Not authenticated with Google Drive');
+
+        const metadata = {
+            name: fileName,
+            parents: selectedFolderId ? [selectedFolderId] : ['root']
+        };
+
+        const form = new FormData();
+        form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+        form.append('file', fileBlob);
+
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const percentComplete = (e.loaded / e.total) * 100;
+                    onProgress && onProgress(percentComplete);
+                }
+            });
+
+            xhr.onload = () => {
+                if (xhr.status === 200) {
+                    resolve(JSON.parse(xhr.responseText));
+                } else {
+                    reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
+                }
+            };
+
+            xhr.onerror = () => reject(new Error('Upload failed: Network error'));
+            xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart');
+            xhr.setRequestHeader('Authorization', `Bearer ${this.accessToken || accessToken}`);
+            xhr.send(form);
+        });
+    }
+
+    async uploadMultipleFiles(files, onProgress, onFileComplete) {
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            try {
+                onProgress && onProgress(i, files.length, 'uploading', file.filename);
+                const result = await this.uploadFile(
+                    file.blob,
+                    file.filename,
+                    (progress) => onProgress && onProgress(i, files.length, 'uploading', file.filename, progress)
+                );
+                file.uploaded = true;
+                file.driveUrl = `https://drive.google.com/file/d/${result.id}/view`;
+                onFileComplete && onFileComplete(file, true, result);
+                onProgress && onProgress(i, files.length, 'success', file.filename, 100);
+            } catch (error) {
+                onFileComplete && onFileComplete(file, false, error);
+                onProgress && onProgress(i, files.length, 'error', file.filename, 0);
+            }
+        }
+    }
+}
+
+// ============================================================
+// DUAL MICROPHONE MANAGER
+// ============================================================
+class DualMicrophoneManager {
+    constructor() {
+        this.streams = [];
+        this.sources = [];
+        this.splitters = [];
+        this.audioContext = null;
+        this.destinationNode = null;
+        this.mediaStreamDestination = null;
+        this.stereoStream = null;
+    }
+
+    async initialize(audioContext) {
+        this.audioContext = audioContext;
+        
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(device => device.kind === 'audioinput');
+            
+            console.log(`🎙️ Found ${audioInputs.length} audio input devices:`);
+            audioInputs.forEach((device, index) => {
+                console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`}`);
+            });
+
+            if (audioInputs.length < 2) {
+                console.warn('⚠️ Only one microphone found. Using mono fallback.');
+                return false;
+            }
+
+            this.mediaStreamDestination = this.audioContext.createMediaStreamDestination();
+            this.stereoStream = this.mediaStreamDestination.stream;
+
+            const firstMic = await navigator.mediaDevices.getUserMedia({
+                audio: { 
+                    deviceId: audioInputs[0].deviceId, 
+                    echoCancellation: false, 
+                    noiseSuppression: false, 
+                    autoGainControl: false 
+                }
+            });
+
+            const secondMic = await navigator.mediaDevices.getUserMedia({
+                audio: { 
+                    deviceId: audioInputs[1].deviceId, 
+                    echoCancellation: false, 
+                    noiseSuppression: false, 
+                    autoGainControl: false 
+                }
+            });
+
+            this.streams = [firstMic, secondMic];
+
+            const source1 = this.audioContext.createMediaStreamSource(firstMic);
+            const source2 = this.audioContext.createMediaStreamSource(secondMic);
+
+            this.sources = [source1, source2];
+
+            const splitter1 = this.audioContext.createChannelSplitter(1);
+            const splitter2 = this.audioContext.createChannelSplitter(1);
+
+            this.splitters = [splitter1, splitter2];
+
+            const merger = this.audioContext.createChannelMerger(2);
+
+            source1.connect(splitter1);
+            splitter1.connect(merger, 0, 0);
+
+            source2.connect(splitter2);
+            splitter2.connect(merger, 0, 1);
+
+            merger.connect(this.mediaStreamDestination);
+
+            console.log('✅ Dual microphone stereo mode ACTIVE');
+            console.log(`   Left Channel: ${audioInputs[0].label || 'Microphone 1'}`);
+            console.log(`   Right Channel: ${audioInputs[1].label || 'Microphone 2'}`);
+
+            return true;
+        } catch (error) {
+            console.error('❌ Dual microphone initialization failed:', error);
+            return false;
+        }
+    }
+
+    getStream() {
+        return this.stereoStream;
+    }
+
+    stopAllStreams() {
+        this.streams.forEach(stream => {
+            stream.getTracks().forEach(track => track.stop());
+        });
+        this.streams = [];
+        this.sources = [];
+        this.splitters = [];
+    }
+}
+
+// ============================================================
 // WAV ENCODER - Creates proper uncompressed PCM WAV files
 // ============================================================
 class WAVEncoder {
     static encodeWAV(audioData, sampleRate, numChannels) {
         const numberOfSamples = audioData[0].length;
         const fmt = {
-            chunkId: [0x66, 0x6d, 0x74, 0x20], // 'fmt '
+            chunkId: [0x66, 0x6d, 0x74, 0x20],
             chunkSize: 16,
-            audioFormat: 1, // PCM
+            audioFormat: 1,
             numChannels: numChannels,
             sampleRate: sampleRate,
-            byteRate: sampleRate * numChannels * 2, // sampleRate * numChannels * bytesPerSample
-            blockAlign: numChannels * 2, // numChannels * bytesPerSample
+            byteRate: sampleRate * numChannels * 2,
+            blockAlign: numChannels * 2,
             bitsPerSample: 16
         };
 
         const data = {
-            chunkId: [0x64, 0x61, 0x74, 0x61], // 'data'
+            chunkId: [0x64, 0x61, 0x74, 0x61],
             chunkSize: numberOfSamples * numChannels * 2
         };
 
         const fileSize = 36 + data.chunkSize;
 
-        // Create WAV file buffer
         const wavBuffer = new ArrayBuffer(44 + data.chunkSize);
         const view = new DataView(wavBuffer);
 
-        // RIFF header
         const setUint32 = (offset, value, littleEndian = true) => 
             view.setUint32(offset, value, littleEndian);
         const setUint16 = (offset, value, littleEndian = true) => 
@@ -35,14 +294,14 @@ class WAVEncoder {
 
         let offset = 0;
 
-        // 'RIFF' chunk descriptor
+        // RIFF header
         setUint8(offset, 0x52); // 'R'
         setUint8(offset + 1, 0x49); // 'I'
         setUint8(offset + 2, 0x46); // 'F'
         setUint8(offset + 3, 0x46); // 'F'
         offset += 4;
 
-        setUint32(offset, fileSize); // File size
+        setUint32(offset, fileSize);
         offset += 4;
 
         setUint8(offset, 0x57); // 'W'
@@ -51,7 +310,7 @@ class WAVEncoder {
         setUint8(offset + 3, 0x45); // 'E'
         offset += 4;
 
-        // 'fmt ' sub-chunk
+        // fmt sub-chunk
         setUint8(offset, 0x66); // 'f'
         setUint8(offset + 1, 0x6d); // 'm'
         setUint8(offset + 2, 0x74); // 't'
@@ -73,7 +332,7 @@ class WAVEncoder {
         setUint16(offset, fmt.bitsPerSample);
         offset += 2;
 
-        // 'data' sub-chunk
+        // data sub-chunk
         setUint8(offset, 0x64); // 'd'
         setUint8(offset + 1, 0x61); // 'a'
         setUint8(offset + 2, 0x74); // 't'
@@ -83,9 +342,9 @@ class WAVEncoder {
         setUint32(offset, data.chunkSize);
         offset += 4;
 
-        // Interleave audio data (L, R, L, R, ...)
+        // Interleave audio data
         let index = 0;
-        const volume = 0.8; // Prevent clipping
+        const volume = 0.8;
         for (let i = 0; i < numberOfSamples; i++) {
             for (let channel = 0; channel < numChannels; channel++) {
                 let sample = Math.max(-1, Math.min(1, audioData[channel][i])) * volume;
@@ -100,7 +359,7 @@ class WAVEncoder {
 }
 
 // ============================================================
-// UPDATED AUDIO RECORDER WITH DIRECT WAV ENCODING
+// AUDIO RECORDER WITH DUAL MIC & WAV ENCODING SUPPORT
 // ============================================================
 class AudioRecorder {
     constructor() {
@@ -116,17 +375,15 @@ class AudioRecorder {
         this.stereoChannelCount = 0;
         this.usingStereoMics = false;
         
-        // For direct audio capture and WAV encoding
-        this.analyserNode = null;
         this.scriptProcessorNode = null;
-        this.audioBuffers = [[], []]; // Left and Right channel buffers
+        this.audioBuffers = [[], []];
         this.sampleRate = 44100;
 
         document.addEventListener('DOMContentLoaded', () => this.initialize());
     }
 
     initialize() {
-        // UI Elements (same as before)
+        // UI Elements
         this.directionSelect = document.getElementById('direction-select');
         this.durationSelect = document.getElementById('duration-select');
         this.distanceSelect = document.getElementById('distance-select');
@@ -154,7 +411,7 @@ class AudioRecorder {
         this.selectFolderButton = document.getElementById('select-folder-button');
         this.selectedFolderNameElement = document.getElementById('selected-folder-name');
 
-        // Bind events
+        // Event bindings
         this.recordButton.onclick = () => this.handleRecordClick();
         this.clearAllButton.onclick = () => this.clearAllRecordings();
         this.uploadAllButton.onclick = () => this.uploadAllToDrive();
@@ -170,7 +427,7 @@ class AudioRecorder {
             };
         }
 
-        // Initial states
+        // Initial state
         this.updateMicrophoneStatus('', 'Initializing audio system...');
         this.recordButton.disabled = true;
         this.clearAllButton.disabled = true;
@@ -235,93 +492,94 @@ class AudioRecorder {
     }
 
     async requestMicrophoneAccess() {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        this.updateMicrophoneStatus('error', 'Microphone not supported');
-        return;
-    }
-
-    try {
-        // Step 1: Initialize audio context first
-        this.initializeAudioContext();
-        this.sampleRate = this.audioContext.sampleRate;
-        console.log(`Sample rate: ${this.sampleRate} Hz`);
-
-        // Step 2: REQUEST PERMISSION FIRST - get a basic mono stream just to grant permission
-        console.log('Requesting microphone permission...');
-        const permissionStream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-        });
-
-        // Permission granted! Now we can enumerate devices
-        console.log('✅ Microphone permission granted');
-
-        // Step 3: Enumerate all audio devices NOW that permission is granted
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const audioInputs = devices.filter(device => device.kind === 'audioinput');
-        
-        console.log(`🎙️ Found ${audioInputs.length} audio input devices:`);
-        audioInputs.forEach((device, index) => {
-            console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`}`);
-        });
-
-        // Step 4: Try dual microphone mode if we have 2+ devices
-        if (audioInputs.length >= 2) {
-            console.log('Attempting dual microphone mode...');
-            const dualMicSuccess = await this.dualMicManager.initialize(this.audioContext);
-
-            if (dualMicSuccess) {
-                this.stream = this.dualMicManager.getStream();
-                this.stereoChannelCount = 2;
-                this.usingStereoMics = true;
-                this.updateMicrophoneStatus('active', '🎙️🎙️ Dual Microphones (True Stereo WAV)');
-                
-                // Stop the permission stream since we're using dual mic streams
-                permissionStream.getTracks().forEach(track => track.stop());
-                
-                this.recordButton.disabled = false;
-                this.statusMessage.textContent = 'Ready to record';
-                return;
-            }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            this.updateMicrophoneStatus('error', 'Microphone not supported');
+            return;
         }
 
-        // Step 5: Fallback - use the permission stream for single mic stereo
-        console.log('Using single microphone with stereo request...');
-        this.stream = permissionStream;
+        try {
+            // Step 1: Initialize audio context
+            this.initializeAudioContext();
+            this.sampleRate = this.audioContext.sampleRate;
+            console.log(`Sample rate: ${this.sampleRate} Hz`);
 
-        const track = this.stream.getAudioTracks()[0];
-        if (track) {
-            const settings = track.getSettings();
-            this.stereoChannelCount = settings.channelCount || 1;
-            console.log('Microphone Settings:', settings);
+            // Step 2: Request permission first
+            console.log('🎙️ Requesting microphone permission...');
+            const permissionStream = await navigator.mediaDevices.getUserMedia({
+                audio: { 
+                    echoCancellation: false, 
+                    noiseSuppression: false, 
+                    autoGainControl: false 
+                }
+            });
+
+            console.log('✅ Microphone permission granted');
+
+            // Step 3: Enumerate all audio devices
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(device => device.kind === 'audioinput');
             
-            if (this.stereoChannelCount === 2) {
-                console.log('✅ Stereo recording ACTIVE (2 channels from single device)');
-                this.updateMicrophoneStatus('active', '🎤 Single Microphone (Stereo WAV)');
-            } else {
-                console.warn('⚠️ System returned mono stream');
-                this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check if your device supports stereo)');
+            console.log(`🎙️ Found ${audioInputs.length} audio input devices:`);
+            audioInputs.forEach((device, index) => {
+                console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`}`);
+            });
+
+            // Step 4: Try dual microphone mode
+            if (audioInputs.length >= 2) {
+                console.log('🔄 Attempting dual microphone mode...');
+                const dualMicSuccess = await this.dualMicManager.initialize(this.audioContext);
+
+                if (dualMicSuccess) {
+                    this.stream = this.dualMicManager.getStream();
+                    this.stereoChannelCount = 2;
+                    this.usingStereoMics = true;
+                    this.updateMicrophoneStatus('active', '🎙️🎙️ Dual Microphones (True Stereo WAV)');
+                    
+                    permissionStream.getTracks().forEach(track => track.stop());
+                    
+                    this.recordButton.disabled = false;
+                    this.statusMessage.textContent = 'Ready to record';
+                    return;
+                }
             }
-        }
 
-        this.recordButton.disabled = false;
-        this.statusMessage.textContent = 'Ready to record';
+            // Step 5: Fallback to single microphone
+            console.log('⚙️ Using single microphone with stereo request...');
+            this.stream = permissionStream;
 
-    } catch (error) {
-        console.error('❌ Microphone Access Error:', error);
-        
-        if (error.name === 'NotAllowedError') {
-            this.updateMicrophoneStatus('error', 'Microphone permission denied - please enable in settings');
-        } else if (error.name === 'NotFoundError') {
-            this.updateMicrophoneStatus('error', 'No microphone found on this device');
-        } else {
-            this.updateMicrophoneStatus('error', `Microphone error: ${error.message}`);
+            const track = this.stream.getAudioTracks()[0];
+            if (track) {
+                const settings = track.getSettings();
+                this.stereoChannelCount = settings.channelCount || 1;
+                console.log('Microphone Settings:', settings);
+                
+                if (this.stereoChannelCount === 2) {
+                    console.log('✅ Stereo recording ACTIVE');
+                    this.updateMicrophoneStatus('active', '🎤 Single Microphone (Stereo WAV)');
+                } else {
+                    console.warn('⚠️ System returned mono stream');
+                    this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check device support)');
+                }
+            }
+
+            this.recordButton.disabled = false;
+            this.statusMessage.textContent = 'Ready to record';
+
+        } catch (error) {
+            console.error('❌ Microphone Access Error:', error);
+            
+            if (error.name === 'NotAllowedError') {
+                this.updateMicrophoneStatus('error', 'Permission denied - enable in settings');
+            } else if (error.name === 'NotFoundError') {
+                this.updateMicrophoneStatus('error', 'No microphone found');
+            } else {
+                this.updateMicrophoneStatus('error', `Error: ${error.message}`);
+            }
+            
+            this.recordButton.disabled = true;
+            this.statusMessage.textContent = 'Microphone access required';
         }
-        
-        this.recordButton.disabled = true;
-        this.statusMessage.textContent = 'Microphone access required';
     }
-}
-
 
     initializeAudioContext() {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -345,7 +603,7 @@ class AudioRecorder {
 
         try {
             this.isRecording = true;
-            this.audioBuffers = [[], []]; // Reset buffers
+            this.audioBuffers = [[], []];
             this.recordButton.disabled = true;
             this.recordButton.classList.add('recording');
             this.recordButtonText.textContent = 'Preparing...';
@@ -354,23 +612,18 @@ class AudioRecorder {
 
             await this.playBeep();
 
-            // Create audio nodes for direct capture
             const source = this.audioContext.createMediaStreamSource(this.stream);
             
-            // ScriptProcessorNode to capture raw audio (deprecated but widely supported)
-            // Alternative: AudioWorklet (more complex but future-proof)
             this.scriptProcessorNode = this.audioContext.createScriptProcessor(4096, 2, 2);
 
             this.scriptProcessorNode.onaudioprocess = (event) => {
                 const leftData = event.inputBuffer.getChannelData(0);
                 const rightData = event.inputBuffer.getChannelData(1);
 
-                // Store samples as Float32
                 this.audioBuffers[0].push(...leftData);
                 this.audioBuffers[1].push(...rightData);
             };
 
-            // Connect source → processor
             source.connect(this.scriptProcessorNode);
             this.scriptProcessorNode.connect(this.audioContext.destination);
 
@@ -395,7 +648,6 @@ class AudioRecorder {
         this.isRecording = false;
         clearInterval(this.countdownInterval);
         
-        // Disconnect audio nodes
         if (this.scriptProcessorNode) {
             this.scriptProcessorNode.disconnect();
         }
@@ -405,7 +657,6 @@ class AudioRecorder {
         this.statusMessage.className = 'status-message processing';
         this.countdownTimer.classList.add('hidden');
 
-        // Process and encode to WAV
         setTimeout(() => this.processRecording(), 100);
     }
 
@@ -450,9 +701,8 @@ class AudioRecorder {
     }
 
     processRecording() {
-        console.log(`Encoding WAV: ${this.audioBuffers[0].length} samples, 2 channels, ${this.sampleRate} Hz`);
+        console.log(`📊 Encoding WAV: ${this.audioBuffers[0].length} samples, 2 channels, ${this.sampleRate} Hz`);
 
-        // Encode to WAV
         const audioBlob = WAVEncoder.encodeWAV(this.audioBuffers, this.sampleRate, 2);
         const filename = this.generateFilename();
 
@@ -519,7 +769,7 @@ class AudioRecorder {
                     <span class="channel-badge">${channelInfo}</span>
                     <span class="mic-badge">${micInfo}</span>
                     <span class="encoding-badge">${encodingInfo}</span>
-                    ${rec.cached ? '<span class="pwa-status offline">Offline</span>' : '<span class="pwa-status online">Online</span>'}
+                    ${rec.cached ? '<span class="pwa-status offline">📱 Offline</span>' : '<span class="pwa-status online">✓ Online</span>'}
                     ${rec.uploaded && rec.driveUrl ? `<a href="${rec.driveUrl}" target="_blank" class="drive-link">View in Drive</a>` : ''}
                 </div>
             </div>
@@ -773,4 +1023,3 @@ class AudioRecorder {
 }
 
 window.audioRecorder = new AudioRecorder();
-
