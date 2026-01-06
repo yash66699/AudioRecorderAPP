@@ -359,7 +359,7 @@ class WAVEncoder {
 }
 
 // ============================================================
-// AUDIO RECORDER
+// AUDIO RECORDER (NO BEEP)
 // ============================================================
 class AudioRecorder {
     constructor() {
@@ -608,14 +608,11 @@ class AudioRecorder {
             this.channelRightData = [];
             this.recordButton.disabled = true;
             this.recordButton.classList.add('recording');
-            this.recordButtonText.textContent = 'Preparing...';
-            this.statusMessage.textContent = 'Playing beep...';
+            this.recordButtonText.textContent = 'Recording...';
+            this.statusMessage.textContent = 'Recording in progress...';
             this.statusMessage.className = 'status-message recording';
 
-            // 1. Play beep first
-            await this.playBeep();
-            
-            // 2. Start capture
+            // Start capture immediately (NO BEEP)
             console.log('🔴 Starting audio capture (SEPARATE CHANNELS)...');
             this.source = this.audioContext.createMediaStreamSource(this.stream);
             
@@ -631,14 +628,10 @@ class AudioRecorder {
 
             this.source.connect(this.scriptProcessorNode);
             
-            // ========== CRITICAL FIX: "Dummy" destination trick ==========
-            // This forces the browser to keep processing (so no 44 byte files)
-            // but effectively mutes it (so no beep feedback)
+            // Keep processor alive but silent (no feedback)
             const silenceTarget = this.audioContext.createMediaStreamDestination();
             this.scriptProcessorNode.connect(silenceTarget);
 
-            this.recordButtonText.textContent = 'Recording...';
-            this.statusMessage.textContent = 'Recording in progress...';
             this.countdownTimer.classList.remove('hidden');
 
             const duration = parseInt(this.durationSelect.value || '2');
@@ -671,33 +664,6 @@ class AudioRecorder {
         this.countdownTimer.classList.add('hidden');
 
         setTimeout(() => this.processRecording(), 100);
-    }
-
-    async playBeep() {
-        return new Promise((resolve) => {
-            if (!this.audioContext) {
-                setTimeout(resolve, 200);
-                return;
-            }
-
-            if (this.audioContext.state === 'suspended') this.audioContext.resume();
-
-            try {
-                const oscillator = this.audioContext.createOscillator();
-                const gainNode = this.audioContext.createGain();
-                oscillator.connect(gainNode);
-                gainNode.connect(this.audioContext.destination);
-                oscillator.frequency.setValueAtTime(440, this.audioContext.currentTime);
-                oscillator.type = 'sine';
-                gainNode.gain.setValueAtTime(0.1, this.audioContext.currentTime);
-                gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.2);
-                oscillator.start();
-                oscillator.stop(this.audioContext.currentTime + 0.2);
-                oscillator.onended = resolve;
-            } catch {
-                setTimeout(resolve, 200);
-            }
-        });
     }
 
     startCountdown(duration) {
