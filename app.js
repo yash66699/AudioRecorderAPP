@@ -260,8 +260,7 @@ class DualMicrophoneManager {
 }
 
 // ============================================================
-// WAV ENCODER - Creates proper uncompressed PCM WAV files
-// Supports both MONO and STEREO
+// WAV ENCODER
 // ============================================================
 class WAVEncoder {
     static encodeWAV(audioData, sampleRate, numChannels) {
@@ -360,8 +359,7 @@ class WAVEncoder {
 }
 
 // ============================================================
-// AUDIO RECORDER WITH DUAL MIC & SEPARATE CHANNEL CAPTURE
-// Captures Left and Right channels SEPARATELY for individual processing
+// AUDIO RECORDER
 // ============================================================
 class AudioRecorder {
     constructor() {
@@ -377,7 +375,8 @@ class AudioRecorder {
         
         this.scriptProcessorNode = null;
         this.source = null;
-        // Store LEFT and RIGHT channels SEPARATELY
+        
+        // Store separated channels
         this.channelLeftData = [];
         this.channelRightData = [];
         this.sampleRate = 44100;
@@ -559,7 +558,7 @@ class AudioRecorder {
                     this.updateMicrophoneStatus('active', '🎤 Single Microphone (Separate Channels)');
                 } else {
                     console.warn('⚠️ System returned mono stream');
-                    this.updateMicrophoneStatus('active', '🔊 Mono Mode');
+                    this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check device support)');
                 }
             }
 
@@ -604,7 +603,7 @@ class AudioRecorder {
 
         try {
             this.isRecording = true;
-            // Reset buffers for fresh capture
+            // Reset buffers
             this.channelLeftData = [];
             this.channelRightData = [];
             this.recordButton.disabled = true;
@@ -613,32 +612,30 @@ class AudioRecorder {
             this.statusMessage.textContent = 'Playing beep...';
             this.statusMessage.className = 'status-message recording';
 
-            // ========== STEP 1: Play beep FIRST (isolated from recording) ==========
+            // 1. Play beep first
             await this.playBeep();
             
-            // ========== STEP 2: Start recording AFTER beep (no delay, clean start) ==========
+            // 2. Start capture
             console.log('🔴 Starting audio capture (SEPARATE CHANNELS)...');
             this.source = this.audioContext.createMediaStreamSource(this.stream);
             
             this.scriptProcessorNode = this.audioContext.createScriptProcessor(4096, 2, 2);
 
-            // ========== CRITICAL: Capture LEFT and RIGHT channels SEPARATELY ==========
             this.scriptProcessorNode.onaudioprocess = (event) => {
                 const leftData = event.inputBuffer.getChannelData(0);
                 const rightData = event.inputBuffer.getChannelData(1);
 
-                // Push into SEPARATE arrays - do NOT merge
                 this.channelLeftData.push(...leftData);
                 this.channelRightData.push(...rightData);
             };
 
             this.source.connect(this.scriptProcessorNode);
             
-            // ========== CRITICAL FIX: Keep processor in graph but mute output ==========
-            const devNull = this.audioContext.createGain();
-            devNull.gain.value = 0;
-            this.scriptProcessorNode.connect(devNull);
-            devNull.connect(this.audioContext.destination);
+            // ========== CRITICAL FIX: "Dummy" destination trick ==========
+            // This forces the browser to keep processing (so no 44 byte files)
+            // but effectively mutes it (so no beep feedback)
+            const silenceTarget = this.audioContext.createMediaStreamDestination();
+            this.scriptProcessorNode.connect(silenceTarget);
 
             this.recordButtonText.textContent = 'Recording...';
             this.statusMessage.textContent = 'Recording in progress...';
@@ -722,7 +719,7 @@ class AudioRecorder {
         console.log(`   Right channel: ${this.channelRightData.length} samples`);
         console.log(`   Sample rate: ${this.sampleRate} Hz`);
 
-        // Create stereo WAV with separate left/right channels
+        // Encode separated channels into a single Stereo WAV
         const stereoData = [this.channelLeftData, this.channelRightData];
         const audioBlob = WAVEncoder.encodeWAV(stereoData, this.sampleRate, 2);
         const filename = this.generateFilename();
@@ -743,7 +740,6 @@ class AudioRecorder {
             channels: 2,
             stereoMics: this.usingStereoMics,
             encoding: 'PCM WAV (Separate Channels)',
-            // Store raw channel data for later individual processing
             rawChannelLeft: this.channelLeftData,
             rawChannelRight: this.channelRightData
         };
