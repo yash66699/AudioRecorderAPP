@@ -376,6 +376,7 @@ class AudioRecorder {
         this.usingStereoMics = false;
         
         this.scriptProcessorNode = null;
+        this.source = null;
         this.audioBuffers = [[], []];
         this.sampleRate = 44100;
 
@@ -397,6 +398,7 @@ class AudioRecorder {
         this.fileCount = document.getElementById('file-count');
         this.uploadAllButton = document.getElementById('upload-all-button');
         this.uploadButtonText = document.getElementById('upload-button-text');
+        this.downloadAllButton = document.getElementById('download-all-button');
         this.clearAllButton = document.getElementById('clear-all-button');
         this.playbackAudio = document.getElementById('playback-audio');
         this.googleSigninBtn = document.getElementById('google-signin-btn');
@@ -415,6 +417,7 @@ class AudioRecorder {
         this.recordButton.onclick = () => this.handleRecordClick();
         this.clearAllButton.onclick = () => this.clearAllRecordings();
         this.uploadAllButton.onclick = () => this.uploadAllToDrive();
+        if (this.downloadAllButton) this.downloadAllButton.onclick = () => this.downloadAllRecordings();
         if (this.googleSigninBtn) this.googleSigninBtn.onclick = () => this.signInToGoogleDrive();
         if (this.googleSignoutBtn) this.googleSignoutBtn.onclick = () => this.signOutFromGoogleDrive();
         this.toggleSetupBtn.onclick = () => this.toggleSetupInstructions();
@@ -432,6 +435,7 @@ class AudioRecorder {
         this.recordButton.disabled = true;
         this.clearAllButton.disabled = true;
         this.uploadAllButton.disabled = true;
+        if (this.downloadAllButton) this.downloadAllButton.disabled = true;
         if (this.selectFolderButton) this.selectFolderButton.disabled = true;
         this.updateFileCount();
         this.updateAuthenticationStatus(false);
@@ -498,12 +502,10 @@ class AudioRecorder {
         }
 
         try {
-            // Step 1: Initialize audio context
             this.initializeAudioContext();
             this.sampleRate = this.audioContext.sampleRate;
             console.log(`Sample rate: ${this.sampleRate} Hz`);
 
-            // Step 2: Request permission first
             console.log('🎙️ Requesting microphone permission...');
             const permissionStream = await navigator.mediaDevices.getUserMedia({
                 audio: { 
@@ -515,7 +517,6 @@ class AudioRecorder {
 
             console.log('✅ Microphone permission granted');
 
-            // Step 3: Enumerate all audio devices
             const devices = await navigator.mediaDevices.enumerateDevices();
             const audioInputs = devices.filter(device => device.kind === 'audioinput');
             
@@ -524,7 +525,6 @@ class AudioRecorder {
                 console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`}`);
             });
 
-            // Step 4: Try dual microphone mode
             if (audioInputs.length >= 2) {
                 console.log('🔄 Attempting dual microphone mode...');
                 const dualMicSuccess = await this.dualMicManager.initialize(this.audioContext);
@@ -543,7 +543,6 @@ class AudioRecorder {
                 }
             }
 
-            // Step 5: Fallback to single microphone
             console.log('⚙️ Using single microphone with stereo request...');
             this.stream = permissionStream;
 
@@ -610,9 +609,12 @@ class AudioRecorder {
             this.statusMessage.textContent = 'Playing beep...';
             this.statusMessage.className = 'status-message recording';
 
+            // ========== KEY FIX: Play beep FIRST without recording ==========
             await this.playBeep();
-
-            const source = this.audioContext.createMediaStreamSource(this.stream);
+            
+            // ========== THEN start recording capture (no delay) ==========
+            console.log('🔴 Starting audio capture...');
+            this.source = this.audioContext.createMediaStreamSource(this.stream);
             
             this.scriptProcessorNode = this.audioContext.createScriptProcessor(4096, 2, 2);
 
@@ -624,7 +626,7 @@ class AudioRecorder {
                 this.audioBuffers[1].push(...rightData);
             };
 
-            source.connect(this.scriptProcessorNode);
+            this.source.connect(this.scriptProcessorNode);
             this.scriptProcessorNode.connect(this.audioContext.destination);
 
             this.recordButtonText.textContent = 'Recording...';
@@ -650,6 +652,9 @@ class AudioRecorder {
         
         if (this.scriptProcessorNode) {
             this.scriptProcessorNode.disconnect();
+        }
+        if (this.source) {
+            this.source.disconnect();
         }
 
         this.recordButtonText.textContent = 'Processing...';
@@ -733,6 +738,7 @@ class AudioRecorder {
         this.showSuccess(navigator.onLine ? `Recording saved (${recordingType})!` : `Saved offline (${recordingType})!`);
         
         this.clearAllButton.disabled = false;
+        if (this.downloadAllButton) this.downloadAllButton.disabled = false;
         if (this.driveManager.isAuthenticated) this.uploadAllButton.disabled = false;
     }
 
@@ -811,6 +817,73 @@ class AudioRecorder {
         }
     }
 
+    async downloadAllRecordings() {
+        if (this.recordings.length === 0) return alert('No recordings to download.');
+
+        this.downloadAllButton.disabled = true;
+        this.statusMessage.textContent = 'Preparing downloads...';
+        this.statusMessage.className = 'status-message processing';
+
+        try {
+            // Check if we have JSZip library available, otherwise download files one by one
+            if (typeof JSZip !== 'undefined') {
+                // Download as ZIP
+                await this.downloadAsZip();
+            } else {
+                // Fallback: download files one by one
+                await this.downloadFilesSequentially();
+            }
+            
+            this.showSuccess(`Downloaded ${this.recordings.length} file(s)!`);
+        } catch (error) {
+            this.showError('Download failed: ' + error.message);
+        } finally {
+            this.downloadAllButton.disabled = false;
+            this.statusMessage.textContent = 'Ready to record';
+            this.statusMessage.className = 'status-message';
+        }
+    }
+
+    async downloadAsZip() {
+        // This requires JSZip library - add to HTML: <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+        const zip = new JSZip();
+        
+        this.recordings.forEach(rec => {
+            zip.file(rec.filename, rec.blob);
+        });
+
+        const content = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(content);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `recordings_${new Date().toISOString().slice(0, 10)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        this.statusMessage.textContent = `Downloading all recordings as ZIP...`;
+    }
+
+    async downloadFilesSequentially() {
+        // Fallback: download each file with a slight delay
+        for (let i = 0; i < this.recordings.length; i++) {
+            const rec = this.recordings[i];
+            const a = document.createElement('a');
+            a.href = rec.url;
+            a.download = rec.filename;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            
+            this.statusMessage.textContent = `Downloading (${i + 1}/${this.recordings.length})...`;
+            
+            // Small delay between downloads to avoid browser blocking
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+    }
+
     deleteRecording(id) {
         if (!confirm('Delete this recording?')) return;
 
@@ -826,6 +899,7 @@ class AudioRecorder {
                 this.showEmptyState();
                 this.clearAllButton.disabled = true;
                 this.uploadAllButton.disabled = true;
+                if (this.downloadAllButton) this.downloadAllButton.disabled = true;
             }
 
             this.updateFileCount();
@@ -843,6 +917,7 @@ class AudioRecorder {
         this.updateFileCount();
         this.clearAllButton.disabled = true;
         this.uploadAllButton.disabled = true;
+        if (this.downloadAllButton) this.downloadAllButton.disabled = true;
         this.showSuccess('All recordings cleared!');
     }
 
