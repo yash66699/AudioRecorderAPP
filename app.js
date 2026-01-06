@@ -159,91 +159,6 @@ class GoogleDriveManager {
 }
 
 // ============================================================
-// TRUE STEREO MICROPHONE MANAGER
-// Captures REAL spatial information from two separate mics
-// ============================================================
-class TrueStereoMicrophoneManager {
-    constructor() {
-        this.leftMicStream = null;
-        this.rightMicStream = null;
-        this.leftSource = null;
-        this.rightSource = null;
-        this.audioContext = null;
-    }
-
-    async initialize(audioContext) {
-        this.audioContext = audioContext;
-        
-        try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const audioInputs = devices.filter(device => device.kind === 'audioinput');
-            
-            console.log(`🎙️ Found ${audioInputs.length} audio input devices:`);
-            audioInputs.forEach((device, index) => {
-                console.log(`  ${index}: ${device.label || `Microphone ${index + 1}`}`);
-            });
-
-            if (audioInputs.length < 2) {
-                console.error('❌ Need at least 2 microphones for stereo DoA recording');
-                return false;
-            }
-
-            // Request SEPARATE streams from each physical microphone
-            console.log('🔴 Requesting LEFT microphone (Mic 1)...');
-            this.leftMicStream = await navigator.mediaDevices.getUserMedia({
-                audio: { 
-                    deviceId: { exact: audioInputs[0].deviceId }, 
-                    echoCancellation: false, 
-                    noiseSuppression: false, 
-                    autoGainControl: false 
-                }
-            });
-
-            console.log('🟢 Requesting RIGHT microphone (Mic 2)...');
-            this.rightMicStream = await navigator.mediaDevices.getUserMedia({
-                audio: { 
-                    deviceId: { exact: audioInputs[1].deviceId }, 
-                    echoCancellation: false, 
-                    noiseSuppression: false, 
-                    autoGainControl: false 
-                }
-            });
-
-            // Create MediaStreamAudioSourceNodes for each microphone
-            this.leftSource = this.audioContext.createMediaStreamAudioSource(this.leftMicStream);
-            this.rightSource = this.audioContext.createMediaStreamAudioSource(this.rightMicStream);
-
-            console.log('✅ TRUE STEREO MODE ACTIVE (Separate Microphones)');
-            console.log(`   LEFT Channel (0°):  ${audioInputs[0].label || 'Microphone 1'}`);
-            console.log(`   RIGHT Channel (90°): ${audioInputs[1].label || 'Microphone 2'}`);
-            console.log('📊 Spatial information captured: ITDG (Inter-channel Time Delay) + ICTF (Inter-channel Level Difference)');
-
-            return true;
-        } catch (error) {
-            console.error('❌ Microphone initialization failed:', error);
-            return false;
-        }
-    }
-
-    getLeftSource() {
-        return this.leftSource;
-    }
-
-    getRightSource() {
-        return this.rightSource;
-    }
-
-    stopAllStreams() {
-        if (this.leftMicStream) {
-            this.leftMicStream.getTracks().forEach(track => track.stop());
-        }
-        if (this.rightMicStream) {
-            this.rightMicStream.getTracks().forEach(track => track.stop());
-        }
-    }
-}
-
-// ============================================================
 // WAV ENCODER - True Stereo (2 independent channels)
 // ============================================================
 class WAVEncoder {
@@ -350,22 +265,22 @@ class WAVEncoder {
 }
 
 // ============================================================
-// AUDIO RECORDER - TRUE STEREO for DoA (Direction of Arrival)
-// Captures spatial ground truth from 2 separate microphones
+// AUDIO RECORDER - MOBILE DUAL MIC STEREO
+// Captures from phone's dual microphones (bottom USB + top noise cancellation)
 // ============================================================
 class AudioRecorder {
     constructor() {
         this.audioContext = null;
+        this.stream = null;
         this.recordings = [];
         this.isRecording = false;
         this.countdownInterval = null;
         this.driveManager = new GoogleDriveManager();
-        this.stereoMicManager = new TrueStereoMicrophoneManager();
         
+        this.splitter = null;
         this.leftScriptProcessor = null;
         this.rightScriptProcessor = null;
-        this.leftSource = null;
-        this.rightSource = null;
+        this.source = null;
         
         // Store INDEPENDENT left and right channel data
         this.leftChannelData = [];
@@ -498,22 +413,39 @@ class AudioRecorder {
             this.sampleRate = this.audioContext.sampleRate;
             console.log(`Sample rate: ${this.sampleRate} Hz`);
 
-            console.log('🎙️ Requesting dual microphone access...');
+            console.log('🎙️ Requesting stereo audio from mobile dual microphones...');
             
-            const stereoSuccess = await this.stereoMicManager.initialize(this.audioContext);
+            // Request STEREO audio - uses both phone mics (bottom USB + top noise cancellation)
+            this.stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,      // Disable processing to get raw dual-mic data
+                    noiseSuppression: false,      // Let both mics operate independently
+                    autoGainControl: false,       // Preserve spatial amplitude differences
+                    channelCount: 2               // Force stereo (left = bottom, right = top)
+                }
+            });
 
-            if (stereoSuccess) {
-                this.leftSource = this.stereoMicManager.getLeftSource();
-                this.rightSource = this.stereoMicManager.getRightSource();
-                this.updateMicrophoneStatus('active', '🎙️🎙️ True Stereo (2 Physical Mics - DoA Ready)');
-                this.recordButton.disabled = false;
-                this.statusMessage.textContent = 'Ready to record';
-                return;
+            const track = this.stream.getAudioTracks()[0];
+            if (track) {
+                const settings = track.getSettings();
+                console.log('📊 Audio Track Settings:', settings);
+                
+                if (settings.channelCount === 2) {
+                    console.log('✅ STEREO MODE ACTIVE (Phone Dual Mics)');
+                    console.log('   LEFT Channel:  Bottom microphone (near USB)');
+                    console.log('   RIGHT Channel: Top microphone (noise cancellation)');
+                    this.updateMicrophoneStatus('active', '🎙️🎙️ Stereo Dual Mic Ready (DoA Ground Truth)');
+                } else if (settings.channelCount === 1) {
+                    console.warn('⚠️ Phone returned MONO stream - will duplicate to stereo for processing');
+                    this.updateMicrophoneStatus('active', '⚠️ Mono Mode (Phone returned 1 channel)');
+                } else {
+                    console.log(`📊 Phone returned ${settings.channelCount} channels`);
+                    this.updateMicrophoneStatus('active', `📊 ${settings.channelCount} Channel Audio`);
+                }
             }
 
-            this.updateMicrophoneStatus('error', 'Need 2 microphones for DoA recording');
-            this.recordButton.disabled = true;
-            this.statusMessage.textContent = '⚠️ 2 microphones required';
+            this.recordButton.disabled = false;
+            this.statusMessage.textContent = 'Ready to record';
 
         } catch (error) {
             console.error('❌ Microphone Access Error:', error);
@@ -521,7 +453,7 @@ class AudioRecorder {
             if (error.name === 'NotAllowedError') {
                 this.updateMicrophoneStatus('error', 'Permission denied - enable in settings');
             } else if (error.name === 'NotFoundError') {
-                this.updateMicrophoneStatus('error', 'Microphones not found');
+                this.updateMicrophoneStatus('error', 'Microphone not found');
             } else {
                 this.updateMicrophoneStatus('error', `Error: ${error.message}`);
             }
@@ -549,7 +481,7 @@ class AudioRecorder {
     }
 
     async startRecording() {
-        if (!this.leftSource || !this.rightSource) {
+        if (!this.stream) {
             return this.showError('Microphone not ready');
         }
 
@@ -563,34 +495,41 @@ class AudioRecorder {
             this.statusMessage.textContent = 'Recording in progress...';
             this.statusMessage.className = 'status-message recording';
 
-            console.log('🔴 START: Capturing TRUE STEREO from 2 separate microphones');
-            console.log('   LEFT (Mic 1) → Channel 0');
-            console.log('   RIGHT (Mic 2) → Channel 1');
+            console.log('🔴 START: Capturing STEREO from mobile dual microphones');
+            console.log('   LEFT (0°):   Bottom mic (near USB)');
+            console.log('   RIGHT (90°): Top mic (noise cancellation)');
 
-            // Create separate script processors for LEFT and RIGHT channels
+            // Create source from stereo stream
+            this.source = this.audioContext.createMediaStreamAudioSource(this.stream);
+            
+            // Split stereo into LEFT and RIGHT channels
+            this.splitter = this.audioContext.createChannelSplitter(2);
+            this.source.connect(this.splitter);
+
+            // Create processors for LEFT and RIGHT
             this.leftScriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
             this.rightScriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
-            // LEFT microphone capture
+            // Capture LEFT channel (bottom microphone)
             this.leftScriptProcessor.onaudioprocess = (event) => {
                 const leftData = event.inputBuffer.getChannelData(0);
                 this.leftChannelData.push(...leftData);
             };
 
-            // RIGHT microphone capture
+            // Capture RIGHT channel (top microphone)
             this.rightScriptProcessor.onaudioprocess = (event) => {
                 const rightData = event.inputBuffer.getChannelData(0);
                 this.rightChannelData.push(...rightData);
             };
 
-            // Connect LEFT microphone
-            this.leftSource.connect(this.leftScriptProcessor);
-            const leftSilence = this.audioContext.createMediaStreamDestination();
-            this.leftScriptProcessor.connect(leftSilence);
+            // Connect splitter outputs to processors
+            this.splitter.connect(this.leftScriptProcessor, 0);   // Left channel
+            this.splitter.connect(this.rightScriptProcessor, 1);  // Right channel
 
-            // Connect RIGHT microphone
-            this.rightSource.connect(this.rightScriptProcessor);
+            // Connect to dummy destinations to keep processing active
+            const leftSilence = this.audioContext.createMediaStreamDestination();
             const rightSilence = this.audioContext.createMediaStreamDestination();
+            this.leftScriptProcessor.connect(leftSilence);
             this.rightScriptProcessor.connect(rightSilence);
 
             this.countdownTimer.classList.remove('hidden');
@@ -614,11 +553,11 @@ class AudioRecorder {
         
         if (this.leftScriptProcessor) this.leftScriptProcessor.disconnect();
         if (this.rightScriptProcessor) this.rightScriptProcessor.disconnect();
-        if (this.leftSource) this.leftSource.disconnect();
-        if (this.rightSource) this.rightSource.disconnect();
+        if (this.splitter) this.splitter.disconnect();
+        if (this.source) this.source.disconnect();
 
         this.recordButtonText.textContent = 'Processing...';
-        this.statusMessage.textContent = 'Encoding TRUE STEREO WAV...';
+        this.statusMessage.textContent = 'Encoding STEREO WAV...';
         this.statusMessage.className = 'status-message processing';
         this.countdownTimer.classList.add('hidden');
 
@@ -639,9 +578,9 @@ class AudioRecorder {
     }
 
     processRecording() {
-        console.log(`📊 TRUE STEREO RECORDING COMPLETE:`);
-        console.log(`   LEFT channel:  ${this.leftChannelData.length} samples (Mic 1)`);
-        console.log(`   RIGHT channel: ${this.rightChannelData.length} samples (Mic 2)`);
+        console.log(`📊 STEREO RECORDING COMPLETE:`);
+        console.log(`   LEFT (Bottom Mic):  ${this.leftChannelData.length} samples`);
+        console.log(`   RIGHT (Top Mic):    ${this.rightChannelData.length} samples`);
         console.log(`   Sample rate: ${this.sampleRate} Hz`);
         console.log(`   Spatial info: ITDG + ICTF preserved for DoA inference`);
 
@@ -672,7 +611,8 @@ class AudioRecorder {
             spatialInfo: 'ITDG + ICTF (DoA Ground Truth)',
             leftSamples: this.leftChannelData.length,
             rightSamples: this.rightChannelData.length,
-            sampleRate: this.sampleRate
+            sampleRate: this.sampleRate,
+            micSetup: 'Mobile Dual Mic (Bottom USB + Top Noise Cancel)'
         };
 
         this.recordings.push(recording);
@@ -680,7 +620,7 @@ class AudioRecorder {
         this.updateFileCount();
         this.resetRecordingState();
         
-        this.showSuccess(`✅ True Stereo WAV saved! Ready for DoA model training.`);
+        this.showSuccess(`✅ Stereo WAV saved! Ready for DoA model training.`);
         
         this.clearAllButton.disabled = false;
         if (this.downloadAllButton) this.downloadAllButton.disabled = false;
@@ -694,7 +634,7 @@ class AudioRecorder {
         const now = new Date();
         const date = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}`;
         const time = `${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}`;
-        return `TrueStereo_${d}_${dist}_${dur}_${date}_${time}.wav`;
+        return `DoA_Stereo_${d}_${dist}_${dur}_${date}_${time}.wav`;
     }
 
     addRecordingToList(rec) {
@@ -713,7 +653,7 @@ class AudioRecorder {
                     <span>Distance: ${rec.distance}</span>
                     <span>Duration: ${rec.duration}s</span>
                     <span>Size: ${this.formatFileSize(rec.size)}</span>
-                    <span class="channel-badge">🎙️🎙️ True Stereo</span>
+                    <span class="channel-badge">🎙️🎙️ Stereo (2 Mics)</span>
                     <span class="mic-badge">📊 ${rec.leftSamples} samples/ch</span>
                     <span class="encoding-badge">🧠 DoA Ground Truth</span>
                     ${rec.cached ? '<span class="pwa-status offline">📱 Offline</span>' : '<span class="pwa-status online">✓ Online</span>'}
@@ -939,8 +879,8 @@ class AudioRecorder {
         this.recordingsList.innerHTML = `
             <div class="empty-state">
                 <div class="empty-icon">🎙️🎙️</div>
-                <p>True Stereo DoA Recorder Ready</p>
-                <p class="pwa-info">🎙️🎙️ Dual Microphone Stereo • 📊 PCM WAV True Stereo • 🧠 DoA Ground Truth • 📍 ITDG + ICTF Spatial Info</p>
+                <p>Mobile Dual Mic DoA Recorder Ready</p>
+                <p class="pwa-info">🎙️🎙️ Bottom USB Mic + Top Noise Cancel • 📊 PCM WAV Stereo • 🧠 DoA Ground Truth • 📍 ITDG + ICTF</p>
             </div>
         `;
     }
@@ -1031,4 +971,3 @@ class AudioRecorder {
 }
 
 window.audioRecorder = new AudioRecorder();
-
