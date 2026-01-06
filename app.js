@@ -261,6 +261,7 @@ class DualMicrophoneManager {
 
 // ============================================================
 // WAV ENCODER - Creates proper uncompressed PCM WAV files
+// Supports both MONO and STEREO
 // ============================================================
 class WAVEncoder {
     static encodeWAV(audioData, sampleRate, numChannels) {
@@ -342,7 +343,7 @@ class WAVEncoder {
         setUint32(offset, data.chunkSize);
         offset += 4;
 
-        // Interleave audio data
+        // Interleave audio data (L, R, L, R, ...)
         let index = 0;
         const volume = 0.8;
         for (let i = 0; i < numberOfSamples; i++) {
@@ -359,12 +360,11 @@ class WAVEncoder {
 }
 
 // ============================================================
-// AUDIO RECORDER WITH DUAL MIC & WAV ENCODING SUPPORT
+// AUDIO RECORDER WITH DUAL MIC & SEPARATE CHANNEL CAPTURE
+// Captures Left and Right channels SEPARATELY for individual processing
 // ============================================================
 class AudioRecorder {
     constructor() {
-        this.mediaRecorder = null;
-        this.audioChunks = [];
         this.audioContext = null;
         this.stream = null;
         this.recordings = [];
@@ -377,7 +377,9 @@ class AudioRecorder {
         
         this.scriptProcessorNode = null;
         this.source = null;
-        this.audioBuffers = [[], []];
+        // Store LEFT and RIGHT channels SEPARATELY
+        this.channelLeftData = [];
+        this.channelRightData = [];
         this.sampleRate = 44100;
 
         document.addEventListener('DOMContentLoaded', () => this.initialize());
@@ -533,7 +535,7 @@ class AudioRecorder {
                     this.stream = this.dualMicManager.getStream();
                     this.stereoChannelCount = 2;
                     this.usingStereoMics = true;
-                    this.updateMicrophoneStatus('active', '🎙️🎙️ Dual Microphones (True Stereo WAV)');
+                    this.updateMicrophoneStatus('active', '🎙️🎙️ Dual Microphones (Separate Channels)');
                     
                     permissionStream.getTracks().forEach(track => track.stop());
                     
@@ -554,10 +556,10 @@ class AudioRecorder {
                 
                 if (this.stereoChannelCount === 2) {
                     console.log('✅ Stereo recording ACTIVE');
-                    this.updateMicrophoneStatus('active', '🎤 Single Microphone (Stereo WAV)');
+                    this.updateMicrophoneStatus('active', '🎤 Single Microphone (Separate Channels)');
                 } else {
                     console.warn('⚠️ System returned mono stream');
-                    this.updateMicrophoneStatus('active', '🔊 Mono Mode (Check device support)');
+                    this.updateMicrophoneStatus('active', '🔊 Mono Mode');
                 }
             }
 
@@ -602,7 +604,9 @@ class AudioRecorder {
 
         try {
             this.isRecording = true;
-            this.audioBuffers = [[], []];
+            // Reset buffers for fresh capture
+            this.channelLeftData = [];
+            this.channelRightData = [];
             this.recordButton.disabled = true;
             this.recordButton.classList.add('recording');
             this.recordButtonText.textContent = 'Preparing...';
@@ -613,23 +617,28 @@ class AudioRecorder {
             await this.playBeep();
             
             // ========== STEP 2: Start recording AFTER beep (no delay, clean start) ==========
-            console.log('🔴 Starting audio capture...');
+            console.log('🔴 Starting audio capture (SEPARATE CHANNELS)...');
             this.source = this.audioContext.createMediaStreamSource(this.stream);
             
             this.scriptProcessorNode = this.audioContext.createScriptProcessor(4096, 2, 2);
 
+            // ========== CRITICAL: Capture LEFT and RIGHT channels SEPARATELY ==========
             this.scriptProcessorNode.onaudioprocess = (event) => {
                 const leftData = event.inputBuffer.getChannelData(0);
                 const rightData = event.inputBuffer.getChannelData(1);
 
-                this.audioBuffers[0].push(...leftData);
-                this.audioBuffers[1].push(...rightData);
+                // Push into SEPARATE arrays - do NOT merge
+                this.channelLeftData.push(...leftData);
+                this.channelRightData.push(...rightData);
             };
 
-            // ========== CRITICAL FIX: DO NOT connect processor to speakers ==========
             this.source.connect(this.scriptProcessorNode);
-            // REMOVED: this.scriptProcessorNode.connect(this.audioContext.destination);
-            // This prevents beep from being recorded
+            
+            // ========== CRITICAL FIX: Keep processor in graph but mute output ==========
+            const devNull = this.audioContext.createGain();
+            devNull.gain.value = 0;
+            this.scriptProcessorNode.connect(devNull);
+            devNull.connect(this.audioContext.destination);
 
             this.recordButtonText.textContent = 'Recording...';
             this.statusMessage.textContent = 'Recording in progress...';
@@ -660,7 +669,7 @@ class AudioRecorder {
         }
 
         this.recordButtonText.textContent = 'Processing...';
-        this.statusMessage.textContent = 'Encoding WAV file...';
+        this.statusMessage.textContent = 'Encoding WAV files...';
         this.statusMessage.className = 'status-message processing';
         this.countdownTimer.classList.add('hidden');
 
@@ -708,9 +717,14 @@ class AudioRecorder {
     }
 
     processRecording() {
-        console.log(`📊 Encoding WAV: ${this.audioBuffers[0].length} samples, 2 channels, ${this.sampleRate} Hz`);
+        console.log(`📊 Recording complete:`);
+        console.log(`   Left channel: ${this.channelLeftData.length} samples`);
+        console.log(`   Right channel: ${this.channelRightData.length} samples`);
+        console.log(`   Sample rate: ${this.sampleRate} Hz`);
 
-        const audioBlob = WAVEncoder.encodeWAV(this.audioBuffers, this.sampleRate, 2);
+        // Create stereo WAV with separate left/right channels
+        const stereoData = [this.channelLeftData, this.channelRightData];
+        const audioBlob = WAVEncoder.encodeWAV(stereoData, this.sampleRate, 2);
         const filename = this.generateFilename();
 
         const recording = {
@@ -728,7 +742,10 @@ class AudioRecorder {
             driveUrl: null,
             channels: 2,
             stereoMics: this.usingStereoMics,
-            encoding: 'PCM WAV'
+            encoding: 'PCM WAV (Separate Channels)',
+            // Store raw channel data for later individual processing
+            rawChannelLeft: this.channelLeftData,
+            rawChannelRight: this.channelRightData
         };
 
         this.recordings.push(recording);
@@ -736,7 +753,7 @@ class AudioRecorder {
         this.updateFileCount();
         this.resetRecordingState();
         
-        const recordingType = this.usingStereoMics ? 'Dual Mic WAV' : 'Stereo WAV';
+        const recordingType = this.usingStereoMics ? 'Dual Mic WAV (Separate)' : 'Stereo WAV (Separate)';
         this.showSuccess(navigator.onLine ? `Recording saved (${recordingType})!` : `Saved offline (${recordingType})!`);
         
         this.clearAllButton.disabled = false;
@@ -762,7 +779,7 @@ class AudioRecorder {
         item.className = `recording-item${rec.uploaded ? ' uploaded' : ''}`;
         item.setAttribute('data-recording-id', rec.id);
 
-        const channelInfo = '🎧 Stereo';
+        const channelInfo = '🎧 Stereo (L/R Separate)';
         const micInfo = rec.stereoMics ? '🎙️🎙️ Dual Mic' : '🎤 Single Mic';
         const encodingInfo = `📊 ${rec.encoding}`;
 
@@ -1001,7 +1018,7 @@ class AudioRecorder {
             <div class="empty-state">
                 <div class="empty-icon">📁</div>
                 <p>No recordings yet. Start recording to see your files here.</p>
-                <p class="pwa-info">📄 Works offline • 📱 Install as app • ☁️ Google Drive sync • 🎙️🎙️ Dual Mic Stereo • 📊 PCM WAV</p>
+                <p class="pwa-info">📄 Works offline • 📱 Install as app • ☁️ Google Drive sync • 🎙️🎙️ Dual Mic Stereo • 📊 PCM WAV (Separate Channels)</p>
             </div>
         `;
     }
