@@ -609,10 +609,10 @@ class AudioRecorder {
             this.statusMessage.textContent = 'Playing beep...';
             this.statusMessage.className = 'status-message recording';
 
-            // ========== KEY FIX: Play beep FIRST without recording ==========
+            // ========== STEP 1: Play beep FIRST (isolated from recording) ==========
             await this.playBeep();
             
-            // ========== THEN start recording capture (no delay) ==========
+            // ========== STEP 2: Start recording AFTER beep (no delay, clean start) ==========
             console.log('🔴 Starting audio capture...');
             this.source = this.audioContext.createMediaStreamSource(this.stream);
             
@@ -626,8 +626,10 @@ class AudioRecorder {
                 this.audioBuffers[1].push(...rightData);
             };
 
+            // ========== CRITICAL FIX: DO NOT connect processor to speakers ==========
             this.source.connect(this.scriptProcessorNode);
-            this.scriptProcessorNode.connect(this.audioContext.destination);
+            // REMOVED: this.scriptProcessorNode.connect(this.audioContext.destination);
+            // This prevents beep from being recorded
 
             this.recordButtonText.textContent = 'Recording...';
             this.statusMessage.textContent = 'Recording in progress...';
@@ -825,12 +827,9 @@ class AudioRecorder {
         this.statusMessage.className = 'status-message processing';
 
         try {
-            // Check if we have JSZip library available, otherwise download files one by one
             if (typeof JSZip !== 'undefined') {
-                // Download as ZIP
                 await this.downloadAsZip();
             } else {
-                // Fallback: download files one by one
                 await this.downloadFilesSequentially();
             }
             
@@ -845,7 +844,6 @@ class AudioRecorder {
     }
 
     async downloadAsZip() {
-        // This requires JSZip library - add to HTML: <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
         const zip = new JSZip();
         
         this.recordings.forEach(rec => {
@@ -866,7 +864,6 @@ class AudioRecorder {
     }
 
     async downloadFilesSequentially() {
-        // Fallback: download each file with a slight delay
         for (let i = 0; i < this.recordings.length; i++) {
             const rec = this.recordings[i];
             const a = document.createElement('a');
@@ -879,7 +876,6 @@ class AudioRecorder {
             
             this.statusMessage.textContent = `Downloading (${i + 1}/${this.recordings.length})...`;
             
-            // Small delay between downloads to avoid browser blocking
             await new Promise(resolve => setTimeout(resolve, 300));
         }
     }
